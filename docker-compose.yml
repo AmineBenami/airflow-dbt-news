@@ -1,0 +1,144 @@
+x-airflow-environment: &airflow-environment
+  environment:
+    - AIRFLOW_USER
+    - AIRFLOW_PASSWORD
+    - AIRFLOW__CORE__FERNET_KEY=_vlbm4VJwSvCYuBSHlOGPqDQyWkgrSp47P8ou6zP0zY=
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_POSTGRES_USER}:${AIRFLOW_POSTGRES_PASSWORD}@${AIRFLOW_POSTGRES_HOST}:${AIRFLOW_POSTGRES_PORT}/${AIRFLOW_POSTGRES_DB}
+    - AIRFLOW__CORE__STORE_SERIALIZED_DAGS=True
+    - AIRFLOW__CORE__STORE_DAG_CODE=True
+    - AIRFLOW__METRICS__STATSD_ON=True
+    - AIRFLOW__METRICS__STATSD_HOST=fdb_airflow_statsd_exporter
+    - AIRFLOW__METRICS__STATSD_PORT=8125
+    - AIRFLOW__METRICS__STATSD_PREFIX=airflow
+    - DBT_POSTGRES_USER
+    - DBT_POSTGRES_PASSWORD
+    - DBT_POSTGRES_DB
+    - DBT_POSTGRES_HOST
+    - DBT_POSTGRES_PORT
+    # The following configurations work for docker resource limit of 12gb and 6cpu's (adjust it accordingly)
+    - AIRFLOW__CORE__PARALLELISM=64
+    - AIRFLOW__CORE__DAG_CONCURRENCY=64
+    - AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG=64
+x-airflow-volumes: &airflow-volumes
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/plugins:/opt/airflow/plugins
+    - airflowlogs:/opt/airflow/logs
+
+version: '3.8'
+services:
+  fdb-dbt-db:
+    image: library/postgres:latest
+    container_name: ${DBT_POSTGRES_HOST}
+    environment:
+      - POSTGRES_USER=${DBT_POSTGRES_USER}
+      - POSTGRES_PASSWORD=${DBT_POSTGRES_PASSWORD}
+      - POSTGRES_DB=${DBT_POSTGRES_DB}
+    ports:
+      - 55432:${DBT_POSTGRES_PORT}
+    restart: unless-stopped
+  fdb-airflow-db:
+    image: library/postgres:latest
+    container_name: ${AIRFLOW_POSTGRES_HOST}
+    environment:
+      - POSTGRES_USER=${AIRFLOW_POSTGRES_USER}
+      - POSTGRES_PASSWORD=${AIRFLOW_POSTGRES_PASSWORD}
+      - POSTGRES_DB=${AIRFLOW_POSTGRES_DB}
+    ports:
+      - 55433:${AIRFLOW_POSTGRES_PORT}
+    restart: unless-stopped
+  fdb-airflow-db-init:
+    <<: *airflow-environment
+    build: .
+    container_name: fdb_airflow_db_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - airflow users list || (
+        airflow db upgrade &&
+        airflow users create --role Admin --username ${AIRFLOW_USER} --email airflow@apache.org --firstname Airflow --lastname Apache --password ${AIRFLOW_PASSWORD}
+        )
+    restart: on-failure
+    depends_on:
+      - fdb-airflow-db
+  fdb-airflow-webserver:
+    <<: *airflow-environment
+    build: .
+    container_name: fdb_airflow_webserver
+    command: webserver
+    ports:
+      - 58080:8080  # airflow webserver
+      - 58081:8081  # dbt docs serve
+      - 58125:8125  # airflow statsd metrics
+    <<: *airflow-volumes
+    depends_on:
+      - fdb-airflow-db-init
+    restart: unless-stopped
+  fdb-airflow-scheduler:
+    build: .
+    <<: *airflow-environment
+    container_name: fdb_airflow_scheduler
+    command: scheduler
+    <<: *airflow-volumes
+    depends_on:
+      - fdb-airflow-db-init
+    restart: unless-stopped
+  fdb-prometheus:
+    image: prom/prometheus:latest
+    container_name: fdb_prometheus
+    ports:
+      - 59090:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    restart: unless-stopped
+  fdb-dbt-db-exporter:
+    image: wrouesnel/postgres_exporter:latest
+    container_name: fdb_dbt_db_exporter
+    ports:
+      - 59187:9187
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${DBT_POSTGRES_USER}:${DBT_POSTGRES_PASSWORD}@${DBT_POSTGRES_HOST}:${DBT_POSTGRES_PORT}/${DBT_POSTGRES_DB}?sslmode=disable
+    restart: unless-stopped
+  fdb-airflow-db-exporter:
+    image: wrouesnel/postgres_exporter:latest
+    container_name: fdb_airflow_db_exporter
+    ports:
+      - 59188:9187
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${AIRFLOW_POSTGRES_USER}:${AIRFLOW_POSTGRES_PASSWORD}@${AIRFLOW_POSTGRES_HOST}:${AIRFLOW_POSTGRES_PORT}/${AIRFLOW_POSTGRES_DB}?sslmode=disable
+    restart: unless-stopped
+  fdb-node-exporter:
+    image: prom/node-exporter:latest
+    container_name: fdb_node_exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - --collector.filesystem.ignored-mount-points
+      - "^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)"
+    ports:
+      - 59100:9100
+    restart: unless-stopped
+  fdb-airflow-statsd-exporter:
+    image: apache/airflow:airflow-statsd-exporter-2020.09.05-v0.17.0
+    container_name: fdb_airflow_statsd_exporter
+    command: "--statsd.listen-udp=:8125 --web.listen-address=:9102"
+    ports:
+      - 59102:9102
+      - 58125:8125/udp
+    restart: unless-stopped
+  fdb-grafana:
+    image: grafana/grafana:latest
+    container_name: fdb_grafana
+    ports:
+      - 53000:3000
+    volumes:
+      - ./grafana:/var/lib/grafana
+    restart: unless-stopped
+volumes:
+  airflowlogs:
+    driver: local
